@@ -14,7 +14,7 @@ env = gurobipy.Env()
 env.setParam('OutputFlag', 0)
 
 
-T = 20
+T = 24
 RNGT = range(1, T+1)
 
 def OpenData():
@@ -27,6 +27,7 @@ def OpenData():
     return load_profile_1, load_profile_2, pv_profile
 
 
+
 class MIP:
     def __init__(self):
         # write the model
@@ -36,19 +37,20 @@ class MIP:
         Horizon = 20
         interest_rate = 0.08
         operational_rate = 0.01
-        PA_factor = ((1 + interest_rate) ** Horizon - 1) / (interest_rate * (1 + interest_rate) ** Horizon)
-        C = {1: 600, 2: 2780 / 4, 3: 150}
-        O = {i: operational_rate * PA_factor * C[i] for i in (1, 2, 3)}
-        CO = {i: (C[i] + O[i]) / (365 * 24) for i in (1, 2, 3)}
+        AP_factor = (interest_rate * (1 + interest_rate) ** Horizon) / ((1 + interest_rate) ** Horizon - 1)
+        C = {1: 600, 2: 695, 3: 150}
+        CO = {i: AP_factor * C[i] * (1 + operational_rate) for i in (1, 2, 3)}
         UB = [166, 80, 40]
         LB = [20, 10, 2]
+        fixed = [60, 70, 40]
         FuelPrice = 3.7
         alpha, beta = 0.5, 0.2
         GridPlus = 0.1497
         GridMinus = alpha * GridPlus
         LoadPrice = GridPlus
         GenerPrice = beta * GridPlus
-        VoLL = np.array([2.1, 1.8, 1.4]) * GridPlus
+        voll = 2
+
         PVSellPrice = (alpha + beta) * GridPlus
         DGSellPrice = PVSellPrice
         PVCurPrice = (alpha + beta) * GridPlus
@@ -61,20 +63,21 @@ class MIP:
 
         # Ranges need to be used
         DVCCount = 3
-        HCount = 2
-        OutageStart = 4
+        HCount = 10
+        OutageStart = 16
+        OutageDur = 5
         RNGDvc = range(1, DVCCount + 1)
         RNGTime = range(1, T + 1)
         RNGTimeMinus = range(1, T)
         RNGHouse = range(1, HCount + 1)
 
         self.RNGTime = RNGTime
+        self.RNGDvc = RNGDvc
 
         # Define the load profiles and PV profiles
-        load = [load1, load2]
-        Load = {(h, t): load[h-1][f'Month {1}'].iloc[t - 1] for h in RNGHouse for t in RNGTime}
+        Load = {t: load1['Month 1'].iloc[t - 1] * 4 for t in RNGTime}
         PV_unit = {t: pv[f'Month {1}'].iloc[t - 1] for t in RNGTime}
-        Out_Time = [OutageStart+i for i in range(3)]
+        VoLL = voll * GridPlus
 
         # Build the model
         model = gurobipy.Model('MIP', env=env)
@@ -86,34 +89,25 @@ class MIP:
         model.addConstrs(X[d] <= UB[d - 1] for d in RNGDvc)
         model.addConstrs(X[d] >= LB[d - 1] for d in RNGDvc)
 
+        model.addConstrs(X[d] == fixed[d-1] for d in RNGDvc)
+
         model.addConstr(quicksum([X[j] * C[j] for j in RNGDvc]) <= Budget, name='budget constraint')
 
         # Second Stage Variables
         Y_indices = [t for t in RNGTime]
-        Yh_indices = [(h, t) for h in RNGHouse for t in RNGTime]
-        Ytg_indices = [t for t in RNGTime]
 
         Y_PVES = model.addVars(Y_indices, name='Y_PVES')
         Y_DGES = model.addVars(Y_indices, name='Y_DGES')
-        Y_GridES = model.addVars(Y_indices, name='Y_GridES')
 
         Y_PVL = model.addVars(Y_indices, name='Y_PVL')
         Y_DGL = model.addVars(Y_indices, name='Y_DGL')
         Y_ESL = model.addVars(Y_indices, name='Y_ESL')
-        Y_GridL = model.addVars(Y_indices, name='Y_GridL')
 
-        Y_LH = model.addVars(Yh_indices, name='Y_LH')
-        Y_LL = model.addVars(Yh_indices, name='Y_LL')
+        Y_LH = model.addVars(Y_indices, name='Y_LH')
+        Y_LL = model.addVars(Y_indices, name='Y_LL')
 
         Y_PVCur = model.addVars(Y_indices, name='Y_PVCur')
         Y_DGCur = model.addVars(Y_indices, name='Y_DGCur')
-
-        Y_PVGrid = model.addVars(Y_indices, name='Y_DGGrid')
-        Y_DGGrid = model.addVars(Y_indices, name='Y_DGGrid')
-        Y_ESGrid = model.addVars(Y_indices, name='Y_ESGrid')
-
-        Y_GridPlus = model.addVars(Y_indices, name='Y_GridPlus')
-        Y_GridMinus = model.addVars(Y_indices, name='Y_GridMinus')
 
         E = model.addVars(Y_indices, name='E')
 
@@ -122,48 +116,34 @@ class MIP:
 
         # Energy storage level
         model.addConstr(E[1] == SOC_UB * X[1])
-        model.addConstr(E[1] == E[T])
         model.addConstrs(SOC_LB * X[1] <= E[t] for t in RNGTime)
         model.addConstrs(E[t] <= SOC_UB * X[1] for t in RNGTime)
 
         # Balance of power flow
         model.addConstrs(E[t + 1] == E[t] +
-                         ES_gamma * (Y_PVES[t] + Y_DGES[t] + Eta_c * Y_GridES[t]) -
-                         Eta_i * (Y_ESL[t] + Y_ESGrid[t]) / ES_gamma
+                         ES_gamma * (Y_PVES[t] + Y_DGES[t]) -
+                         Eta_i * (Y_ESL[t]) / ES_gamma
                          for t in RNGTimeMinus)
 
         # The share of Load
-        model.addConstrs(quicksum(Load[(h, t)] for h in RNGHouse) >=
-                         Eta_i * (Y_ESL[t] + Y_DGL[t] + Y_PVL[t]) + Y_GridL[t]
+        model.addConstrs(Eta_i * (Y_ESL[t] + Y_DGL[t] + Y_PVL[t]) <= Load[t] for t in RNGTime)
+
+        model.addConstrs(Y_LH[t] <= Load[t] for t in RNGTime)
+
+        model.addConstrs(Y_LH[t] == Eta_i * (Y_ESL[t] + Y_DGL[t] + Y_PVL[t])
                          for t in RNGTime)
 
-        model.addConstrs(Y_LH[(h, t)] <= Load[(h, t)]
-                         for h in RNGHouse for t in RNGTime)
-
-        model.addConstrs(quicksum(Y_LH[(h, t)] for h in RNGHouse) ==
-                         Eta_i * (Y_ESL[t] + Y_DGL[t] + Y_PVL[t]) + Y_GridL[t]
+        model.addConstrs(Y_PVL[t] + Y_PVES[t] + Y_PVCur[t] == PV_unit[t] * X[2]
                          for t in RNGTime)
 
-        model.addConstrs(Y_PVL[t] + Y_PVES[t] + Y_PVCur[t] + Y_PVGrid[t] == PV_unit[t] * X[2]
+        model.addConstrs(Y_DGL[t] + Y_DGES[t] + Y_DGCur[t] == X[3]
                          for t in RNGTime)
 
-        model.addConstrs(Y_GridPlus[t] == Y_GridES[t] + Y_GridL[t]
+        model.addConstrs(Y_ESL[t] <= UB[0] * u[t]
                          for t in RNGTime)
 
-        model.addConstrs(Y_GridMinus[t] == Eta_i * (Y_ESGrid[t] + Y_PVGrid[t] + Y_DGGrid[t])
+        model.addConstrs(Y_PVES[t] + Y_DGES[t] <= UB[0] * (1 - u[t])
                          for t in RNGTime)
-
-        model.addConstrs(Y_DGL[t] + Y_DGES[t] + Y_DGGrid[t] + Y_DGCur[t] == X[3]
-                         for t in RNGTime)
-
-        model.addConstrs(Y_ESL[t] + Y_ESGrid[t] <= UB[0] * u[t]
-                         for t in RNGTime)
-
-        model.addConstrs(Y_PVES[t] + Y_GridES[t] + Y_DGES[t] <= UB[0] * (1 - u[t])
-                         for t in RNGTime)
-
-        model.addConstrs(Y_GridPlus[t] == 0 for t in Out_Time)
-        model.addConstrs(Y_GridMinus[t] == 0 for t in Out_Time)
         model.update()
 
         # Objective
@@ -171,16 +151,12 @@ class MIP:
         Cost2 = PVCurPrice * quicksum((Y_PVCur[t] + Y_DGCur[t])
                          for t in RNGTime)
 
-        Cost3 = quicksum(VoLL[h - 1] * (Load[(h, t)] - Y_LH[(h, t)])
-                          for h in RNGHouse for t in RNGTime)
+        Cost3 = quicksum(VoLL * (Load[t] - Y_LH[t]) for t in RNGTime)
 
-        Cost4 = FuelPrice * DG_gamma * quicksum(Y_DGL[t] + Y_DGGrid[t] + Y_DGCur[t] + Y_DGES[t]
+        Cost4 = FuelPrice * DG_gamma * quicksum(Y_DGL[t] + Y_DGCur[t] + Y_DGES[t]
                                                 for t in RNGTime)
 
-        Cost5 = quicksum(GridPlus * Y_GridPlus[t] - GridMinus * Y_GridMinus[t] -
-                                              GenerPrice * X[2] * PV_unit[t] - quicksum(LoadPrice * Y_LH[(h, t)]
-                                                                                             for h in RNGHouse)
-                        for t in RNGTime)
+        Cost5 = quicksum(- GenerPrice * X[2] * PV_unit[t] - LoadPrice * Y_LH[t] for t in RNGTime)
         model.setObjective(Cost1 + 12 * (31*24/T) * (Cost2 + Cost3 + Cost4 + Cost5), sense=GRB.MINIMIZE)
         model.update()
         self.model = model
@@ -213,6 +189,9 @@ class MIP:
         bin_dict = {t: int(U[t-1]) for t in RNGT}
         return bin_dict
 
+    def Solve(self):
+        self.model.optimize()
+        return self.model.ObjVal
 
 class GA:
     def __init__(self, gen_size, gen_count, selection_size, first_gen, mut_prob, cros_prob, parents_save):
@@ -237,8 +216,10 @@ class GA:
         best_fitness_found = self.generation_fitness[first_best]
         best_solution_found = self.generation[first_best]
 
-        # Create a list to save the generation data which is: [itr, avg(fitness), min(fitness), argmin(fitness)
-        solution = []
+        # Create a list to save the generation data which is: [itr, avg(fitness), min(fitness)
+        solution = {'Iteration': [],
+                    'Avg Fitness': [],
+                    'Best Fitness': []}
         start_time = time.time()
 
         # Start GA
@@ -265,9 +246,13 @@ class GA:
             if best_fitness <= best_fitness_found:
                 best_fitness_found = best_fitness
                 best_solution_found = self.generation[index_best]
-                solution.append([itr+1, avg_fitness, best_fitness_found])
+                solution['Iteration'].append(itr+1)
+                solution['Avg Fitness'].append(avg_fitness)
+                solution['Best Fitness'].append(best_fitness_found)
             else:
-                solution.append([itr + 1, avg_fitness, best_fitness_found])
+                solution['Iteration'].append(itr + 1)
+                solution['Avg Fitness'].append(avg_fitness)
+                solution['Best Fitness'].append(best_fitness_found)
 
         finish_time = time.time()-start_time
         return solution, best_solution_found, finish_time
@@ -397,21 +382,47 @@ if __name__ == '__main__':
     M = MIP()
     parents_save = 2
     generation_size = 10
-    selection_size = generation_size - parents_save
-    generation_count = 200
+    selection_size = generation_size
+    generation_count = 100
     mutation_probability = 1/generation_size
     crossover_probability = 0.9
+    trials = 30
+    summary = {'Avg Avg Fitness': [0 for _ in range(generation_count)],
+               'Avg Best Fitness': [0 for _ in range(generation_count)]}
 
-    U = [M.ToBinList(M.GetInitialInd()) for _ in range(generation_size)]
+    for trial in range(1, trials+1):
+        print(f'{100 * trial/trials:0.0f}%|{trial * "="}{(trials-trial) * " "}| Trial {trial}/{trials}')
+        U = [M.ToBinList(M.GetInitialInd()) for _ in range(generation_size)]
+        ga = GA(gen_size=generation_size, gen_count=generation_count, selection_size=selection_size, first_gen=U,
+                mut_prob=mutation_probability, cros_prob=crossover_probability, parents_save=parents_save)
+        solution, optimal, runtime = ga.RunGA(M)
+        # Recall: solution is a dictionary with keys: Iteration, Avg Fitness, Best Fitness
+        summary['Avg Avg Fitness'] = np.add(summary['Avg Avg Fitness'], solution['Avg Fitness'])
+        summary['Avg Best Fitness'] = np.add(summary['Avg Best Fitness'], solution['Best Fitness'])
 
-    ga = GA(gen_size=generation_size, gen_count=generation_count, selection_size=selection_size, first_gen=U,
-            mut_prob=mutation_probability, cros_prob=crossover_probability, parents_save=parents_save)
-    solution, optimal, runtime = ga.RunGA(M)
-    pd = pd.DataFrame(solution, columns=['itr', 'avg-fitness', 'best-fitness'])
-    plt.plot(pd['best-fitness'], label='Best Fitness')
-    plt.plot(pd['avg-fitness'], label='Avg Fitness')
+    # Compare with exact solution
+    start = time.time()
+    EModel = MIP()
+    Optimal = EModel.Solve()
+
+
+    name = f'GC({generation_count})'
+    summary['Avg Avg Fitness'] = np.divide(summary['Avg Avg Fitness'], trials)
+    summary['Avg Best Fitness'] = np.divide(summary['Avg Best Fitness'], trials)
+    pd.DataFrame(summary).to_csv(f'Summary-{name}.csv')
+
+    fig1 = plt.figure(dpi=300)
+    plt.boxplot(summary['Avg Best Fitness'])
+    plt.savefig(f'IMG/BP-{name}.jpg', bbox_inches='tight')
+
+    fig2 = plt.figure()
+    df = pd.DataFrame(pd.DataFrame(solution))
+    plt.plot(range(1, generation_count + 1), df['Best Fitness'], label='Best Fitness')
+    plt.plot(range(1, generation_count + 1), df['Avg Fitness'], label='Avg Fitness')
+    plt.plot([1, generation_count + 1], [Optimal, Optimal], label='Optimal Value')
     plt.legend()
-    plt.savefig('Fitness-Reduction.jpg')
+    plt.savefig(f'IMG/FR-{name}.jpg')
+
 
 
 
