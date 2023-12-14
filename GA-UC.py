@@ -388,10 +388,10 @@ if __name__ == '__main__':
     parents_save = 4
     generation_size = 15
     selection_size = 15
-    generation_count = 500
+    generation_count = 100
     mutation_probability = 0.05
     crossover_probability = 0.9
-    crossover_probability_detail = 0.3
+    crossover_probability_detail = 0.5
     pair_select = 'T'  # 'T' or 'R'
     cross_lenght = 5
     trials = 20
@@ -442,9 +442,10 @@ if __name__ == '__main__':
         trials_result['Demand Viol'].append((best_cost - (SUC+MUDC+FC))/lmda0)
 
     name = f'GC({generation_count}){pair_select}'
+
+
     avg_fitness['Avg Avg Fitness'] = np.divide(avg_fitness['Avg Avg Fitness'], trials)
     avg_fitness['Avg Best Fitness'] = np.divide(avg_fitness['Avg Best Fitness'], trials)
-
     with open(f'Result/{name}.pkl', 'wb') as handle:
         pickle.dump([trials_result, avg_fitness], handle)
     handle.close()
